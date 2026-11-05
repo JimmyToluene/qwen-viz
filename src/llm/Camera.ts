@@ -1,5 +1,5 @@
-import { IModelLayout } from "./GptModelLayout";
-import { IProgramState } from "./Program";
+import { IModelLayout } from "./types";
+import { IProgramState } from "./types";
 import { Mat4f } from "@/src/utils/matrix";
 import { BoundingBox3d, Vec3 } from "@/src/utils/vector";
 import { IRenderView } from "./render/modelRender";
