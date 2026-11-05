@@ -10,7 +10,7 @@ import { initSharedRender, RenderPhase, writeModelViewUbo } from "./sharedRender
 import { cameraToMatrixView } from "../Camera";
 import { initTriRender, renderAllTris, resetTriRender, uploadAllTris } from "./triRender";
 import { createQueryManager, IQueryManager } from "./queryManager";
-import { IProgramState } from "../Program";
+import { IProgramState } from "../types";
 import { ISyncObject } from "./syncObjects";
 
 export interface IRenderView {

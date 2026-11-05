@@ -1,4 +1,4 @@
-import { IBlkDef, IModelLayout } from "../GptModelLayout";
+import { IBlkDef, IModelLayout } from "../types";
 import { Mat4f } from "@/src/utils/matrix";
 import { bindFloatAttribs, createFloatBuffer, createShaderProgram, IGLContext } from "@/src/utils/shader";
 import { Dim, Vec3, Vec4 } from "@/src/utils/vector";
