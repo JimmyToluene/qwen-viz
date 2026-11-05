@@ -165,57 +165,32 @@ export function initBlockRender(ctx: IGLContext | null) {
 
             bool hasValue = u_accessTexScale > 0.0;
             if (hasValue) {
-                // Fill the whole cell: at this model's scale cells are often only a few pixels.
-                // Near-white is zero, the block's colour is positive, dark slate is negative.
                 ivec2 accessPos = ivec2(u_accessMtx * vec4(blockPos, 1.0));
                 float val = texelFetch(u_accessSampler, accessPos, 0).r * u_accessTexScale;
-                float weight = pow(clamp(abs(val), 0.0, 1.0), 0.7);
-                vec3 zeroColor = vec3(0.93, 0.93, 0.91);
-                vec3 posColor = u_baseColor.rgb * 0.92;
-                vec3 negColor = vec3(0.10, 0.11, 0.17);
+                float weight = clamp(abs(val), 0.0, 1.0);
+                vec3 zeroColor = vec3(0.945, 0.937, 0.925);
+                vec3 posColor = u_baseColor.rgb;
+                vec3 negColor = vec3(0.13, 0.39, 0.67);
                 baseColor = mix(zeroColor, val >= 0.0 ? posColor : negColor, weight);
+                // Values belong on the front and back faces. The other faces only show depth;
+                // colouring them from the edge cells paints heavy bands across a stack of blocks.
+                if (abs(v_normal.z) < 0.5) {
+                    baseColor = abs(v_normal.y) > 0.5 ? vec3(0.87, 0.86, 0.84) : vec3(0.78, 0.77, 0.75);
+                }
+            } else {
+                baseColor = u_baseColor.rgb;
             }
 
-            if (true) {
-                // The axis along the face normal has zero derivative. Mask it out explicitly
-                // rather than relying on how a driver treats the resulting NaN.
+            // A thin outline only. Upstream's 16-cell grid competes with the data at this density.
+            {
                 vec3 faceMask = 1.0 - abs(v_normal);
-                vec3 block16 = v_blockPos / 16.0;
-                vec3 pxPerBlock16 = 1.0 / max(fwidth(block16), vec3(1e-6));
-                float strength16 = min(min(pxPerBlock16.x, pxPerBlock16.y), pxPerBlock16.z);
-                vec3 colorEdge = vec3(1.0, 1.0, 1.0);
-                vec3 color16 = vec3(1.0, 1.0, 1.0) * 0.7;
-                vec3 color256 = vec3(1.0, 1.0, 1.0);
-
-                // if we're zoomed out enough, show 256 & (256 * 16) grid lines
-                // the 16 grid lines are faded out by this point (fade out between 10px -> 1px)
-                if (strength16 < 2.0) {
-                    block16 = block16 / 16.0;
-                    pxPerBlock16 = 1.0 / max(fwidth(block16), vec3(1e-6));
-                    strength16 = min(min(pxPerBlock16.x, pxPerBlock16.y), pxPerBlock16.z);
-                    color16 = color256;
-                    // orange
-                    color256 = vec3(1.0, 0.7, 0.4);
-                }
-
-                float visibility16 = smoothstep(2.0, 10.0, strength16); // below 10px between lines, fade out
-                vec3 block16Grid = (1.0 - abs(fract(block16 - 0.5) - 0.5) * pxPerBlock16) * faceMask;
-                float line16 = max(max(block16Grid.x, block16Grid.y), block16Grid.z) * visibility16;
-
-                vec3 block256 = block16 / 16.0;
-                vec3 block256Grid = (1.0 - abs(fract(block256 - 0.5) - 0.5) / max(fwidth(block256), vec3(1e-6))) * faceMask;
-                float line256 = max(max(block256Grid.x, block256Grid.y), block256Grid.z);
-
                 vec3 cube = v_cubePos - v_normal * 0.1;
                 vec3 cubeGrid = (1.0 - abs(fract(cube - 0.5) - 0.5) / max(fwidth(cube), vec3(1e-6))) * faceMask;
                 float lineCube = max(max(cubeGrid.x, cubeGrid.y), cubeGrid.z);
-
-                float edgeWeight = smoothstep(0.0, 1.0, max(max(line16 * (hasValue ? 0.35 : 1.0), lineCube * 0.8), line256 * (hasValue ? 0.5 : 1.0)));
-                vec3 color = lineCube > 0.0 ? vec3(0.45, 0.45, 0.48) : (line256 > 0.0 ? color256 : color16);
-                baseColor = mix(baseColor, color, edgeWeight);
+                baseColor = mix(baseColor, vec3(0.55, 0.55, 0.57), smoothstep(0.0, 1.0, lineCube) * 0.9);
             }
 
-            vec3 color = mix(hasValue ? baseColor : baseColor * 0.7, u_baseColor.rgb, u_highlight);
+            vec3 color = mix(baseColor, u_baseColor.rgb, u_highlight);
 
             o_color = vec4(color, 1) * u_baseColor.a;
         }`;

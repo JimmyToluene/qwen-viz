@@ -2,13 +2,11 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchFontAtlasData, IFontAtlasData } from '@/src/llm/render/fontRender';
 import { Vec3 } from '@/src/utils/vector';
-import { fetchEmbedWeights, fetchIndex, fetchLayer, fetchTrace, fmt, IIndex, ITensor, ITrace } from './data';
+import { fetchEmbedWeights, fetchIndex, fetchLayer, fetchTrace, fmt, IIndex, ITrace, showTok } from './data';
 import { IQBlock } from './layout';
-import { axisText, buildLayout, currentStep, DEFAULT_FULL, DEFAULT_LINEAR, fitCamera, hitTest, initState, IQState, project, runFrame, setTrace } from './program';
-import { STEPS } from './steps';
+import { axisText, DEFAULT_FULL, DEFAULT_LINEAR, hitTest, initState, IQState, project, runFrame, setTrace } from './program';
+import { ICtx, STEPS } from './steps';
 import './qwen.scss';
-
-const SHORT_LAYER = (t: string) => t === 'full_attention' ? 'full' : 'linear';
 
 export function View() {
     let [index, setIndex] = useState<IIndex | null>(null);
@@ -27,8 +25,8 @@ export function View() {
         return () => { stale = true; };
     }, [promptKey]);
 
-    if (error) return <div className="q-msg">Could not load the trace: {error}</div>;
-    if (!index || !font || !trace) return <div className="q-msg">Loading Qwen3.5-4B trace…</div>;
+    if (error) return <div className="q-msg">The trace could not be loaded: {error}</div>;
+    if (!index || !font || !trace) return <div className="q-msg">Loading the trace…</div>;
     return <Scene index={index} font={font} trace={trace} promptKey={promptKey} setPromptKey={setPromptKey} />;
 }
 
@@ -36,15 +34,19 @@ const Scene: React.FC<{ index: IIndex; font: IFontAtlasData; trace: ITrace; prom
     let canvasRef = useRef<HTMLCanvasElement>(null);
     let overlayRef = useRef<HTMLDivElement>(null);
     let tipRef = useRef<HTMLDivElement>(null);
+    let bodyRef = useRef<HTMLDivElement>(null);
     let stRef = useRef<IQState | null>(null);
+    let dirtyRef = useRef<() => void>(() => { });
     let [glError, setGlError] = useState(false);
     let [stepIdx, setStepIdx] = useState(0);
+    let [layer, setLayer] = useState(DEFAULT_LINEAR);
     let [tokenCursor, setTokenCursor] = useState(0);
     let [playing, setPlaying] = useState(false);
-    let [expanded, setExpanded] = useState<number | null>(null);
-    let [loadingLayer, setLoadingLayer] = useState(false);
     let [selected, setSelected] = useState<IQBlock | null>(null);
-    let dirtyRef = useRef<() => void>(() => { });
+    let [showToc, setShowToc] = useState(false);
+    let [frontView, setFrontView] = useState(false);
+    let [, setLayoutVer] = useState(0);
+    let [, setDataTick] = useState(0);
     let step = STEPS[stepIdx];
     let T = trace.manifest.T;
 
@@ -66,6 +68,7 @@ const Scene: React.FC<{ index: IIndex; font: IFontAtlasData; trace: ITrace; prom
                 canvas.width = bcr.width * dpr;
                 canvas.height = bcr.height * dpr;
                 st!.render.size = new Vec3(bcr.width, bcr.height);
+                if (sizeDirty) st!.pendingFit = true;
                 sizeDirty = false;
             }
             let dt = Math.max(8, time - prev);
@@ -77,6 +80,7 @@ const Scene: React.FC<{ index: IIndex; font: IFontAtlasData; trace: ITrace; prom
             if (!raf) raf = requestAnimationFrame(loop);
         }
         dirtyRef.current = markDirty;
+        st.overlay.onLayout = v => setLayoutVer(v);
         let ro = new ResizeObserver(() => { sizeDirty = true; markDirty(); });
         ro.observe(canvas);
         let onWheel = (ev: WheelEvent) => ev.preventDefault();
@@ -88,63 +92,70 @@ const Scene: React.FC<{ index: IIndex; font: IFontAtlasData; trace: ITrace; prom
         // eslint-disable-next-line
     }, []);
 
-    // ---- HTML labels that follow the 3D scene (they can show any Unicode token) ----
+    // ---- HTML labels that follow the 3D scene; they can show any Unicode token ----
     useEffect(() => {
         let st = stRef.current;
         if (!st) return;
         st.overlay.onFrame = (s) => {
             let box = overlayRef.current;
             if (!box) return;
-            let step = currentStep(s);
-            let els = box.querySelectorAll<HTMLElement>('[data-a]');
-            els.forEach(el => {
-                let kind = el.dataset.a, i = +el.dataset.i!;
-                let pos: Vec3 | null = null;
-                if (kind === 'tok') {
-                    let a = s.layout.tokenAnchor[i];
-                    if (a) pos = new Vec3(a.x, a.y, a.z);
-                } else {
-                    let tag = s.layout.tags.find(t => t.layer === i);
-                    if (tag) pos = new Vec3(tag.x, tag.y, tag.z);
-                }
-                if (!pos) { el.style.display = 'none'; return; }
-                let [x, y, ok] = project(s, pos);
-                let sz = s.render.size;
-                let vis = ok && x > -50 && x < sz.x + 50 && y > -20 && y < sz.y + 20;
-                if (kind === 'tok') {
-                    // Only label tokens when there is room to read them.
-                    let a0 = s.layout.tokenAnchor[0], a1 = s.layout.tokenAnchor[1];
-                    if (a1) {
-                        let [x0] = project(s, new Vec3(a0.x, a0.y, a0.z));
-                        let [x1] = project(s, new Vec3(a1.x, a1.y, a1.z));
-                        vis = vis && Math.abs(x1 - x0) > 7;
+            let sz = s.render.size;
+            box.querySelectorAll<HTMLElement>('[data-a]').forEach(el => {
+                let kind = el.dataset.a, p: Vec3 | null = null;
+                let vis = true;
+                if (kind === 'lbl') {
+                    let b = s.layout.byKey[el.dataset.k!];
+                    if (b) {
+                        // A title moves below its block only when token labels really occupy the top edge.
+                        let [x0] = project(s, new Vec3(b.x, b.y, b.z + b.dz));
+                        let [x1] = project(s, new Vec3(b.x + b.dx / b.cx, b.y, b.z + b.dz));
+                        let [xr] = project(s, new Vec3(b.x + b.dx + 18, b.y, b.z + b.dz));
+                        let below = !!el.dataset.tokentop && Math.abs(x1 - x0) > 10.5;
+                        el.classList.toggle('below', below);
+                        (el.firstElementChild as HTMLElement).style.width = `${Math.max(58, Math.round(xr - x0))}px`;
+                        p = new Vec3(b.x, below ? b.y + b.dy : b.y, b.z + b.dz);
                     }
-                }
-                if (kind === 'tag') {
-                    // tags only make sense when they don't overlap; check the spacing on screen
-                    let tag2 = s.layout.tags.find(t => t.layer === (i === 0 ? 1 : i - 1));
-                    if (tag2) {
-                        let [, y2] = project(s, new Vec3(tag2.x, tag2.y, tag2.z));
-                        let spacing = Math.abs(y - y2);
-                        vis = vis && (spacing > 14 || i % 4 === 3 && spacing > 3.4);
+                } else if (kind === 'op') {
+                    let o = s.layout.ops[+el.dataset.i!];
+                    if (o) p = new Vec3(o.x, o.y, o.z);
+                } else if (kind === 'tok') {
+                    let b = s.layout.byKey[el.dataset.k!], i = +el.dataset.i!;
+                    if (b) {
+                        if (el.dataset.axis === 'top') {
+                            p = new Vec3(b.x + (i + 0.5) * b.dx / b.cx, b.y, b.z + b.dz);
+                            let [x0] = project(s, new Vec3(b.x, b.y, b.z)), [x1] = project(s, new Vec3(b.x + b.dx / b.cx, b.y, b.z));
+                            vis = Math.abs(x1 - x0) > 10.5;
+                        } else {
+                            p = new Vec3(b.x, b.y + (i + 0.5) * b.dy / b.cy, b.z + b.dz);
+                        }
                     }
+                } else if (kind === 'tag') {
+                    let t = s.layout.tags.find(g => g.layer === +el.dataset.i!);
+                    if (t) p = new Vec3(t.x, t.y, t.z);
                 }
+                if (!p) { el.style.display = 'none'; return; }
+                let [x, y, ok] = project(s, p);
+                if (kind === 'lbl' && el.classList.contains('below')) {
+                    // The bottom edge slopes in 3D: sit below its lowest point, not its left end.
+                    let b = s.layout.byKey[el.dataset.k!];
+                    let [, yr] = project(s, new Vec3(b.x + b.dx, b.y + b.dy, b.z + b.dz));
+                    y = Math.max(y, yr);
+                }
+                vis = vis && ok && x > -60 && x < sz.x + 60 && y > -20 && y < sz.y + 20;
                 el.style.display = vis ? 'block' : 'none';
                 if (vis) el.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
             });
             let h = s.hover, tip = tipRef.current;
             if (tip) {
-                if (h) {
+                if (h && h.block.tensor) {
                     tip.style.display = 'block';
-                    tip.style.transform = `translate(${h.screen[0] + 14}px, ${h.screen[1] + 14}px)`;
-                    let lines = axisText(s, h);
-                    let scale = h.block.tensor;
+                    let tx = Math.min(h.screen[0] + 14, sz.x - 230);
+                    tip.style.transform = `translate(${tx}px, ${h.screen[1] + 14}px)`;
                     tip.innerHTML = '';
                     let add = (t: string, c?: string) => { let d = document.createElement('div'); d.textContent = t; if (c) d.className = c; tip!.appendChild(d); };
                     add(h.block.title, 'q-tip-title');
-                    lines.forEach(l => add(l));
-                    if (h.value !== null) add(`value ≈ ${fmt(h.value)}`, 'q-tip-val');
-                    if (scale) add('click for detail', 'q-tip-hint');
+                    axisText(s, h).forEach(l => add(l));
+                    if (h.value !== null) add(`value ≈ ${fmt(h.value)}`);
                 } else {
                     tip.style.display = 'none';
                 }
@@ -159,89 +170,64 @@ const Scene: React.FC<{ index: IIndex; font: IFontAtlasData; trace: ITrace; prom
         if (firstTrace.current) { firstTrace.current = false; return; }
         let st = stRef.current;
         if (!st) return;
-        setTrace(st, trace);
         setSelected(null);
         setTokenCursor(c => Math.min(c, trace.manifest.T - 1));
-        if (st.expanded !== null) {
-            let e = st.expanded;
-            fetchLayer(trace, e).then(() => { st!.layoutDirty = true; st!.pendingFit = true; dirtyRef.current(); });
-        }
-        dirtyRef.current();
+        let needLayer = STEPS[st.stepIdx].layer !== 'none';
+        let apply = () => { setTrace(st!, trace); setDataTick(n => n + 1); dirtyRef.current(); };
+        if (needLayer) fetchLayer(trace, st.layer).then(apply); else apply();
     }, [trace]);
 
-    // ---- Expand a layer once its files have arrived ----
-    let expand = useCallback(async (layer: number | null, refit: boolean) => {
+    // ---- Moving between steps and layers ----
+    let goTo = useCallback(async (i: number, requested?: number) => {
         let st = stRef.current;
-        if (!st) return;
-        if (layer === null) {
-            st.expanded = null;
-            setExpanded(null);
-        } else {
-            setLoadingLayer(true);
-            await fetchLayer(st.trace, layer);
-            setLoadingLayer(false);
-            st.expanded = layer;
-            setExpanded(layer);
-        }
+        i = Math.max(0, Math.min(STEPS.length - 1, i));
+        setPlaying(false);
+        setShowToc(false);
+        setSelected(null);
+        if (!st) { setStepIdx(i); return; }
+        st.selectedKey = null;
+        let s = STEPS[i], types = st.index.layer_types;
+        let l = requested ?? st.layer;
+        if (s.layer === 'linear' && types[l] !== 'linear_attention') l = requested !== undefined ? l : DEFAULT_LINEAR;
+        if (s.layer === 'full' && types[l] !== 'full_attention') l = requested !== undefined ? l : DEFAULT_FULL;
+        if (s.layer !== 'none') await fetchLayer(st.trace, l);
+        st.stepIdx = i;
+        st.layer = l;
         st.layoutDirty = true;
-        if (refit) {
-            st.layout = buildLayout(st);
-            st.layoutDirty = false;
-            fitCamera(st);
-        }
+        st.pendingFit = true;
+        setStepIdx(i);
+        setLayer(l);
+        setDataTick(n => n + 1);
+        bodyRef.current?.scrollTo(0, 0);
         dirtyRef.current();
     }, []);
 
-    // Open a layer from the scene. A second click closes it. If the current step is about the
-    // other kind of layer, move to the matching section so the layer isn't dimmed.
-    let browse = useCallback(async (layer: number) => {
+    // Choose a layer. If this section does not apply to that kind of layer, open its section 3.1.
+    let chooseLayer = useCallback((l: number) => {
         let st = stRef.current;
         if (!st) return;
-        if (st.expanded === layer) {
-            await expand(null, false);
-            return;
-        }
-        let want = st.index.layer_types[layer] === 'full_attention' ? 'full' : 'linear';
+        let kind = st.index.layer_types[l] === 'full_attention' ? 'full' : 'linear';
         let cur = STEPS[st.stepIdx].layer;
-        if (cur !== 'none' && cur !== want) {
-            let i = STEPS.findIndex(s => s.layer === want);
-            st.stepIdx = i;
-            setStepIdx(i);
-        }
-        await expand(layer, false);
-        let s = stRef.current!;
-        s.layout = buildLayout(s);
-        s.layoutDirty = false;
-        frameLayer(s, layer);
-    }, [expand]);
-
-    let stepTo = useCallback(async (i: number) => {
-        let st = stRef.current;
-        i = Math.max(0, Math.min(STEPS.length - 1, i));
-        setStepIdx(i);
-        setPlaying(false);
-        if (!st) return;
-        st.stepIdx = i;
-        let s = STEPS[i];
-        let want: number | null = st.expanded;
-        let types = st.index.layer_types;
-        if (s.layer === 'none') want = null;
-        else if (s.layer === 'linear' && (want === null || types[want] !== 'linear_attention')) want = DEFAULT_LINEAR;
-        else if (s.layer === 'full' && (want === null || types[want] !== 'full_attention')) want = DEFAULT_FULL;
-        await expand(want, true);
-    }, [expand]);
+        let ok = cur === 'any' || cur === kind;
+        goTo(ok ? st.stepIdx : STEPS.findIndex(s => s.id === 'layer'), l);
+    }, [goTo]);
 
     // ---- Keyboard ----
     useEffect(() => {
         let onKey = (e: KeyboardEvent) => {
-            if ((e.target as HTMLElement)?.tagName === 'SELECT' || (e.target as HTMLElement)?.tagName === 'INPUT') return;
-            if (e.key === 'ArrowRight' || e.key === 'PageDown') { stepTo(stepIdx + 1); e.preventDefault(); }
-            if (e.key === 'ArrowLeft' || e.key === 'PageUp') { stepTo(stepIdx - 1); e.preventDefault(); }
-            if (e.key === 'Escape') setSelected(null);
+            let tag = (e.target as HTMLElement)?.tagName;
+            if (tag === 'SELECT' || tag === 'INPUT') return;
+            if (e.key === 'ArrowRight' || e.key === 'PageDown') { goTo(stepIdx + 1); e.preventDefault(); }
+            if (e.key === 'ArrowLeft' || e.key === 'PageUp') { goTo(stepIdx - 1); e.preventDefault(); }
+            if (e.key === 'Escape') {
+                setSelected(null); setShowToc(false);
+                if (stRef.current) stRef.current.selectedKey = null;
+                dirtyRef.current();
+            }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-    }, [stepIdx, stepTo]);
+    }, [stepIdx, goTo]);
 
     // ---- Token cursor ----
     useEffect(() => {
@@ -258,9 +244,17 @@ const Scene: React.FC<{ index: IIndex; font: IFontAtlasData; trace: ITrace; prom
                 if (c + 1 >= T) { setPlaying(false); return c; }
                 return c + 1;
             });
-        }, 700);
+        }, 800);
         return () => clearInterval(id);
     }, [playing, T]);
+
+    let activate = useCallback((b: IQBlock) => {
+        let st = stRef.current;
+        if (!st) return;
+        if (b.layer !== null) { chooseLayer(b.layer); return; }
+        setSelected(b.tensor ? b : null);
+        st.selectedKey = b.tensor ? b.key : null;
+    }, [chooseLayer]);
 
     // ---- Mouse ----
     let dragRef = useRef<{ x: number; y: number; moved: boolean; rotate: boolean; center: Vec3; angle: Vec3 } | null>(null);
@@ -298,21 +292,13 @@ const Scene: React.FC<{ index: IIndex; font: IFontAtlasData; trace: ITrace; prom
         let onUp = () => {
             let st = stRef.current, d = dragRef.current;
             dragRef.current = null;
-            if (st && d && !d.moved && st.hover) {
-                let b = st.hover.block;
-                if (b.group === 'tower' && b.layer !== null) {
-                    browse(b.layer);
-                } else {
-                    setSelected(b.tensor ? b : null);
-                    st.selectedKey = b.tensor ? b.key : null;
-                }
-            }
+            if (st && d && !d.moved && st.hover) activate(st.hover.block);
             dirtyRef.current();
         };
         window.addEventListener('mousemove', onMove);
         window.addEventListener('mouseup', onUp);
         return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
-    }, [browse]);
+    }, [activate]);
 
     // ---- Touch: one finger pans, two fingers pinch-zoom and rotate, a tap selects ----
     useEffect(() => {
@@ -355,23 +341,14 @@ const Scene: React.FC<{ index: IIndex; font: IFontAtlasData; trace: ITrace; prom
                     Math.max(-87, Math.min(87, start.angle.y + midDy * 0.5)),
                     Math.max(0.6, Math.min(5000, start.angle.z * spread(start.pts) / Math.max(1, spread(p)))));
             }
-            st.mouse = [-1, -1];
+            if (start.moved) st.mouse = [-1, -1];
             dirtyRef.current();
         };
         let onEnd = (e: TouchEvent) => {
             let st = stRef.current;
             if (!st || !start || e.touches.length > 0) return;
             // A quick tap can end before the next frame has run the hit test.
-            if (!start.moved) hitTest(st);
-            if (!start.moved && st.hover) {
-                let b = st.hover.block;
-                if (b.group === 'tower' && b.layer !== null) {
-                    browse(b.layer);
-                } else {
-                    setSelected(b.tensor ? b : null);
-                    st.selectedKey = b.tensor ? b.key : null;
-                }
-            }
+            if (!start.moved) { hitTest(st); if (st.hover) activate(st.hover.block); }
             start = null;
             st.mouse = [-1, -1];
             dirtyRef.current();
@@ -384,106 +361,111 @@ const Scene: React.FC<{ index: IIndex; font: IFontAtlasData; trace: ITrace; prom
             cv!.removeEventListener('touchmove', onMove);
             cv!.removeEventListener('touchend', onEnd);
         };
-    }, [browse]);
+    }, [activate]);
 
     function onWheel(e: React.WheelEvent) {
         let st = stRef.current;
         if (!st) return;
         st.camera.desiredCameraTransition = undefined;
         let a = st.camera.angle;
-        let z = Math.max(0.6, Math.min(5000, a.z * Math.pow(1.0013, e.deltaY)));
-        st.camera.angle = new Vec3(a.x, a.y, z);
+        st.camera.angle = new Vec3(a.x, a.y, Math.max(0.6, Math.min(5000, a.z * Math.pow(1.0013, e.deltaY))));
         dirtyRef.current();
     }
 
-    function frameLayer(s: IQState, layer: number) {
-        let bl = s.layout.cubes.filter(c => c.layer === layer);
-        if (bl.length === 0) return;
-        let minX = Math.min(...bl.map(c => c.x)), maxX = Math.max(...bl.map(c => c.x + c.dx));
-        let minY = Math.min(...bl.map(c => c.y)), maxY = Math.max(...bl.map(c => c.y + c.dy));
-        let tan = Math.tan(20 * Math.PI / 180), asp = s.render.size.x / s.render.size.y;
-        let dist = Math.max((maxY - minY) / (2 * tan), (maxX - minX) / (2 * tan * asp)) * 1.2;
-        s.camera.desiredCamera = { center: new Vec3((minX + maxX) / 2, 0, -(minY + maxY) / 2), angle: new Vec3(290, 12, dist / 200) };
-        dirtyRef.current();
-    }
-
-    let last = trace.manifest.predictions[T - 1];
-    let sections = STEPS.map(s => s.section).filter((s, i, a) => a.indexOf(s) === i);
-    let currentType = expanded !== null ? index.layer_types[expanded] : null;
+    let st = stRef.current;
+    let data = trace.layers.get(layer) ?? null;
+    let ctx: ICtx = { index, trace, layer, act: data?.act ?? null, w: data?.w ?? null, tokenCursor };
+    let scene = st?.layout;
+    let labelBlocks = scene ? scene.cubes.filter(c => c.label) : [];
+    let tokenTexts = trace.manifest.tokens.map(t => showTok(t.text));
+    let isTower = step.scene === 'tower';
+    let hasTop = (key: string) => scene?.tokenAxes.some(a => a.key === key && a.axis === 'top');
 
     return <div className="q-root">
-        <aside className="q-side">
-            <header className="q-head">
-                <h1>Qwen3.5-4B, in 3D</h1>
-                <div className="q-sub">A real forward pass. {((index.params.text + index.params.vision) / 1e9).toFixed(2)}B parameters, 32 layers.</div>
-                <label className="q-prompt">
+        <aside className="q-paper">
+            <header className="q-running">
+                <span>Qwen3.5-4B: one forward pass</span>
+                <button onClick={() => setShowToc(v => !v)} aria-expanded={showToc}>Contents</button>
+            </header>
+            {showToc ? <nav className="q-toc" aria-label="Contents">
+                <ol>
+                    {STEPS.map((s, i) => <li key={s.id} className={s.num.includes('.') ? 'sub' : ''}>
+                        <button className={i === stepIdx ? 'on' : ''} onClick={() => goTo(i)}><span>{s.num}</span> {s.title}</button>
+                    </li>)}
+                </ol>
+            </nav> : <article className="q-body" ref={bodyRef} key={step.id}>
+                <h2><span>{step.num}</span> {step.title}</h2>
+                {step.body(ctx)}
+            </article>}
+            <footer className="q-nav">
+                <button disabled={stepIdx === 0} onClick={() => goTo(stepIdx - 1)}>Previous</button>
+                <span>{stepIdx + 1} of {STEPS.length}</span>
+                <button disabled={stepIdx === STEPS.length - 1} onClick={() => goTo(stepIdx + 1)}>Next</button>
+            </footer>
+        </aside>
+
+        <main className="q-figure">
+            <div className="q-controls">
+                <label>
                     <span>Prompt</span>
                     <select aria-label="Prompt" value={promptKey} onChange={e => setPromptKey(e.target.value)}>
                         {index.prompts.map(p => <option key={p.key} value={p.key}>{p.text.replace('\n', ' ⏎ ')}</option>)}
                     </select>
                 </label>
-                <div className="q-answer">Predicts <b>{JSON.stringify(last[0].text)}</b> at {(last[0].p * 100).toFixed(1)}%</div>
-            </header>
-
-            <nav className="q-toc" aria-label="Walkthrough sections">
-                {sections.map(sec => <div key={sec} className="q-toc-sec">
-                    <div className="q-toc-name">{sec}</div>
-                    <div className="q-toc-dots">
-                        {STEPS.map((s, i) => s.section === sec &&
-                            <button key={s.id} aria-label={s.title} title={s.title} className={i === stepIdx ? 'on' : ''} onClick={() => stepTo(i)} />)}
+                {step.layer !== 'none' && <div className="q-strip" role="group" aria-label="Layer">
+                    <span>Layer {layer}, {index.layer_types[layer] === 'full_attention' ? 'full' : 'linear'}</span>
+                    <div>
+                        {index.layer_types.map((t, i) => <button key={i} aria-label={`Layer ${i}, ${t === 'full_attention' ? 'full attention' : 'linear attention'}`}
+                            title={`Layer ${i}`} className={`${t === 'full_attention' ? 'full' : ''} ${i === layer ? 'on' : ''}`} onClick={() => chooseLayer(i)} />)}
                     </div>
-                </div>)}
-            </nav>
-
-            <article className="q-body" key={step.id}>
-                <div className="q-eyebrow">{step.section}{step.layer !== 'none' && expanded !== null ? ` · layer ${expanded}` : ''}</div>
-                <h2>{step.title}</h2>
-                {step.tokenSlider && currentType === 'linear_attention' && <div className="q-slider">
-                    <div className="q-slider-top">
-                        <button onClick={() => { if (tokenCursor >= T - 1) setTokenCursor(0); setPlaying(p => !p); }}>{playing ? 'Pause' : 'Play'}</button>
-                        <span>after token {tokenCursor}: <b>{JSON.stringify(trace.manifest.tokens[tokenCursor]?.text)}</b></span>
-                    </div>
-                    <input type="range" aria-label="Token" min={0} max={T - 1} value={tokenCursor} onChange={e => { setPlaying(false); setTokenCursor(+e.target.value); }} />
                 </div>}
-                {step.body}
-                {step.predictions && <ol className="q-preds">
-                    {last.map(p => <li key={p.id}>
-                        <span className="q-pred-t">{JSON.stringify(p.text)}</span>
-                        <span className="q-pred-bar"><span style={{ width: `${Math.max(0.5, p.p * 100)}%` }} /></span>
-                        <span className="q-pred-p">{(p.p * 100).toFixed(1)}%</span>
-                    </li>)}
-                </ol>}
-            </article>
-
-            <footer className="q-nav">
-                <button disabled={stepIdx === 0} onClick={() => stepTo(stepIdx - 1)}>Back</button>
-                <span>{stepIdx + 1} / {STEPS.length}</span>
-                <button className="primary" disabled={stepIdx === STEPS.length - 1} onClick={() => stepTo(stepIdx + 1)}>Next</button>
-            </footer>
-            <div className="q-credit">Built on <a href="https://github.com/bbycroft/llm-viz" target="_blank" rel="noreferrer">llm-viz</a> by Brendan Bycroft (MIT).</div>
-        </aside>
-
-        <main className="q-main">
-            <canvas ref={canvasRef} className="q-canvas" onMouseDown={onDown} onWheel={onWheel} onContextMenu={e => e.preventDefault()} />
-            {glError && <div className="q-msg">This page needs a browser with WebGL2.</div>}
-            <div ref={overlayRef} className="q-overlay">
-                {trace.manifest.tokens.map((t, i) => <div key={`t${i}`} data-a="tok" data-i={i} className="q-tok"><span>{t.text.replace(/\n/g, '⏎') || ' '}</span></div>)}
-                {index.layer_types.map((t, i) => {
-                    let lens = trace.manifest.lens[i][0];
-                    return <div key={`l${i}`} data-a="tag" data-i={i} className={`q-tag q-tag-${SHORT_LAYER(t)}`}>
-                        <button aria-label={`Open layer ${i}`} onClick={() => { browse(i); }}>L{i}</button>
-                        <span className="q-tag-lens">{JSON.stringify(lens.text)} {(lens.p * 100).toFixed(0)}%</span>
-                    </div>;
-                })}
+                {step.tokenSlider && <div className="q-slider">
+                    <button onClick={() => { if (tokenCursor >= T - 1) setTokenCursor(0); setPlaying(p => !p); }}>{playing ? 'Pause' : 'Play'}</button>
+                    <input type="range" aria-label="Token" min={0} max={T - 1} value={tokenCursor} onChange={e => { setPlaying(false); setTokenCursor(+e.target.value); }} />
+                    <span>after <code className="q-t">{showTok(trace.manifest.tokens[tokenCursor]?.text ?? '')}</code></span>
+                </div>}
+                <button className="q-viewbtn" onClick={() => {
+                    let st = stRef.current;
+                    if (!st) return;
+                    st.frontView = !frontView;
+                    st.pendingFit = true;
+                    setFrontView(!frontView);
+                    dirtyRef.current();
+                }}>{frontView ? '3D view' : 'Front view'}</button>
             </div>
-            <div ref={tipRef} className="q-tip" style={{ display: 'none' }} />
-            <div className="q-legend">
-                <span><i className="k w" /> weights</span>
-                <span><i className="k i" /> linear layer / computed value</span>
-                <span><i className="k a" /> full-attention / memory</span>
-                {loadingLayer && <span>loading layer…</span>}
+            <div className="q-stage">
+                <canvas ref={canvasRef} className="q-canvas" onMouseDown={onDown} onWheel={onWheel} onContextMenu={e => e.preventDefault()} />
+                {glError && <div className="q-msg">This page requires a browser with WebGL2.</div>}
+                <div ref={overlayRef} className="q-overlay">
+                    {labelBlocks.map(b => <div key={b.key} data-a="lbl" data-k={b.key} data-tokentop={scene?.tokenAxes.some(a => a.key === b.key && a.axis === 'top') ? '1' : undefined}
+                        className="q-lbl" style={{ display: 'none' }}>
+                        <div><b>{b.title}</b>{b.shapeText && <span>{b.shapeText}</span>}</div>
+                    </div>)}
+                    {scene?.ops.map((o, i) => <div key={`o${i}`} data-a="op" data-i={i} className={o.kind ? `q-note-${o.kind}` : 'q-op'} style={{ display: 'none' }}><span>{o.text}</span></div>)}
+                    {scene?.tokenAxes.flatMap(ax => tokenTexts.map((t, i) => <div key={`${ax.key}${ax.axis}${i}`} data-a="tok" data-k={ax.key} data-i={i} data-axis={ax.axis}
+                        className={`q-tk q-tk-${ax.axis}`} style={{ display: 'none' }}><span>{t}</span></div>))}
+                    {isTower && index.layer_types.map((t, i) => {
+                        let lens = trace.manifest.lens[i][0];
+                        let show = step.lensTags || i % 4 === 3 || i === 0;
+                        return show ? <div key={`l${i}`} data-a="tag" data-i={i} className="q-tag" style={{ display: 'none' }}>
+                            <div>
+                                <span className="q-tag-n">L{i}</span>
+                                {step.lensTags && <code className="q-t">{showTok(lens.text)}</code>}
+                                {step.lensTags && <span className="q-tag-p">{(lens.p * 100).toFixed(0)}%</span>}
+                            </div>
+                        </div> : null;
+                    })}
+                </div>
+                <div ref={tipRef} className="q-tip" style={{ display: 'none' }} />
+                {selected && selected.tensor && <Inspector block={selected} tokens={trace.manifest.tokens.map(t => t.text)} onClose={() => { setSelected(null); if (stRef.current) stRef.current.selectedKey = null; dirtyRef.current(); }} />}
             </div>
-            {selected && selected.tensor && <Inspector block={selected} tokens={trace.manifest.tokens.map(t => t.text)} onClose={() => { setSelected(null); if (stRef.current) stRef.current.selectedKey = null; dirtyRef.current(); }} />}
+            <figcaption className="q-caption">
+                <div className="q-legend" aria-hidden={false}>
+                    {(step.legend === 'div' || step.legend === 'both') && <span className="q-scale"><i className="div" /><small>−</small><small>0</small><small>+</small></span>}
+                    {(step.legend === 'seq' || step.legend === 'both') && <span className="q-scale"><i className="seq" /><small>0</small><small /><small>1</small></span>}
+                </div>
+                <p><b>Figure {stepIdx + 1}:</b> {step.caption(ctx)} Prompt: <code className="q-t">{trace.manifest.text.replace('\n', '⏎')}</code></p>
+            </figcaption>
         </main>
     </div>;
 };
@@ -500,25 +482,26 @@ const Inspector: React.FC<{ block: IQBlock; tokens: string[]; onClose: () => voi
     useEffect(() => {
         let cv = ref.current;
         if (!cv) return;
-        let pos = block.t === 'w' ? [70, 70, 235] : block.t === 'a' ? [235, 188, 70] : [94, 188, 94];
-        let s = t.scale / 127 / (t.p99 || 1);
+        let seq = block.t === 'a';
+        let pos = seq ? [26, 31, 43] : [178, 51, 43];
+        // Same colour scale as the 3D view.
+        let s = seq && t.scale <= 1 && !sl ? 1 / 127 : t.scale / 127 / (t.p99 || 1);
         let color = (i: number) => {
-            // Same colour scale as the 3D view.
             let v = Math.max(-1, Math.min(1, t.data[offset + i] * s));
-            let a = Math.pow(Math.abs(v), 0.7), tgt = v >= 0 ? pos : [26, 28, 43];
-            return [237 + (tgt[0] - 237) * a, 237 + (tgt[1] - 237) * a, 232 + (tgt[2] - 232) * a];
+            let a = Math.abs(v), tgt = v >= 0 ? pos : [33, 99, 171];
+            return [241 + (tgt[0] - 241) * a, 239 + (tgt[1] - 239) * a, 236 + (tgt[2] - 236) * a];
         };
         let ctx = cv.getContext('2d')!;
         if (labelled) {
-            // A token x token matrix, large enough to read which token looks at which.
+            // A token × token matrix, large enough to read which token relates to which.
             let dpr = 2, cw = Math.min(26, Math.floor(330 / cols)), gutter = 84, head = 66;
             cv.width = (gutter + cw * cols) * dpr;
             cv.height = (head + cw * rows) * dpr;
             cv.style.width = `${gutter + cw * cols}px`;
             ctx.scale(dpr, dpr);
-            ctx.font = '11px system-ui, "Noto Sans CJK SC", sans-serif';
+            ctx.font = '11px ui-monospace, Menlo, Consolas, "Noto Sans CJK SC", monospace';
             ctx.fillStyle = '#22242a';
-            let show = (x: string) => JSON.stringify(x).slice(1, -1).slice(0, 12);
+            let show = (x: string) => showTok(x).slice(0, 12);
             for (let r = 0; r < rows; r++) {
                 ctx.textAlign = 'right';
                 ctx.fillText(show(tokens[r]), gutter - 5, head + r * cw + cw * 0.7);
@@ -546,7 +529,7 @@ const Inspector: React.FC<{ block: IQBlock; tokens: string[]; onClose: () => voi
             }
             ctx.putImageData(img, 0, 0);
         }
-    }, [block, cols, rows, t, offset, labelled, tokens]);
+    }, [block, cols, rows, t, offset, labelled, tokens, sl]);
     let shown = t.shape.join(' × ');
     let full = (t.full_shape ?? t.shape).join(' × ');
     return <section className="q-insp" aria-label="Block detail">
@@ -555,17 +538,15 @@ const Inspector: React.FC<{ block: IQBlock; tokens: string[]; onClose: () => voi
             <button onClick={onClose} aria-label="Close">×</button>
         </div>
         <div className="q-insp-canvas"><canvas ref={ref} className={labelled ? 'labelled' : ''} style={labelled ? undefined : { aspectRatio: `${cols} / ${Math.max(rows, cols / 10)}` }} /></div>
-        {labelled && <p className="q-note q-insp-axis">Rows: reading token. Columns: earlier token.</p>}
         <dl>
             <dt>Shape</dt><dd>{full}</dd>
-            {sampled && <><dt>Shown</dt><dd>{shown} (exact values, every {t.stride!.join(' × ')}th)</dd></>}
-            {!sampled && !sl && <><dt>Shown</dt><dd>every value</dd></>}
+            {sampled && <><dt>Shown</dt><dd>{shown}: exact values, every {t.stride!.join(' × ')}th</dd></>}
+            {!sampled && !sl && <><dt>Shown</dt><dd>All stored values</dd></>}
             {sl && <><dt>Shown</dt><dd>{sl.note}</dd></>}
             <dt>Mean</dt><dd>{fmt(t.full_mean ?? t.mean)}</dd>
             <dt>Std</dt><dd>{fmt(t.full_std ?? t.std)}</dd>
-            {t.full_min !== undefined && <><dt>Range</dt><dd>{fmt(t.full_min)} to {fmt(t.full_max!)}</dd></>}
-            {t.full_min === undefined && <><dt>Max |x|</dt><dd>{fmt(t.scale)}</dd></>}
+            {t.full_min !== undefined ? <><dt>Range</dt><dd>{fmt(t.full_min)} to {fmt(t.full_max!)}</dd></> : <><dt>Max |x|</dt><dd>{fmt(t.scale)}</dd></>}
         </dl>
-        <p className="q-note">{sampled ? 'Mean, std and range cover the whole matrix. ' : sl ? 'Mean, std and max cover all heads. ' : ''}Stored at 8 bits, so values are accurate to ±{fmt(t.scale / 254)}. Colour saturates at the 99th percentile.</p>
+        <p className="q-note">{sampled ? 'Statistics cover the whole matrix. ' : sl && t.shape.length > 2 ? 'Statistics cover all heads. ' : ''}Stored at 8 bits, to within ±{fmt(t.scale / 254)}. The colour limit is the 99th percentile.</p>
     </section>;
 };

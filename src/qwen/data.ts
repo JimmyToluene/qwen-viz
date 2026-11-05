@@ -39,6 +39,7 @@ export interface IManifest {
     predictions: IPred[][];
     lens: IPred[][];
     checks: Record<string, number>;
+    attn_last: { layer: number; weights: number[] }[];
 }
 
 export type ITensorSet = Record<string, ITensor>;
@@ -108,4 +109,10 @@ export function fmt(v: number) {
     let a = Math.abs(v);
     if (a !== 0 && (a < 1e-3 || a >= 1e4)) return v.toExponential(2);
     return v.toFixed(a < 1 ? 3 : 2);
+}
+
+// How a token is printed: no quotes or leading space, but whitespace-only tokens stay visible.
+export function showTok(t: string) {
+    let v = t.replace(/\n/g, '⏎').replace(/\t/g, '⇥');
+    return v.trim() || v.replace(/ /g, '␣') || '␣';
 }

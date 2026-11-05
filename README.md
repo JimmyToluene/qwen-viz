@@ -12,10 +12,22 @@ which has no attention matrix.
 
 - `tracer/trace.py` runs the model and writes `public/q35/`.
 - `src/qwen/data.ts` loads those files, one layer at a time.
-- `src/qwen/layout.ts` places every tensor in 3D. To change the scene, start here.
-- `src/qwen/steps.tsx` is the walkthrough text and which blocks each step shows.
-- `src/qwen/program.ts` is the frame loop, camera framing, arrows, labels and hit testing.
+- `src/qwen/layout.ts` builds one small scene per section. To change a figure, start here.
+- `src/qwen/steps.tsx` holds the text and captions. Numbers in the text are computed from the loaded trace, so
+  they stay correct for every prompt and layer; don't type results in by hand.
+- `src/qwen/program.ts` is the frame loop, camera framing, arrows and hit testing.
 - `src/qwen/View.tsx` is the page, the input handling and the inspector.
+
+## Writing and figure conventions
+
+The text follows the style of Long, Sebo et al. (2026) and Gurnee et al. (2026). Each section asks a question or
+states a claim, then gives the method, the result and what was not shown. Interpretation is labelled as such, and
+derived quantities are labelled as derived. Each figure makes one point and has a numbered caption that says what
+is plotted. A signed value uses a blue-to-red scale and a value in [0, 1] uses a light-to-dark ink scale.
+
+The default view is 3D, with thin weight sheets and thicker computed blocks; a control switches to a front view.
+Every stored weight must appear in some figure. If a figure becomes too dense to label, split it rather than
+dropping a weight.
 
 ## What is real and what is sampled
 

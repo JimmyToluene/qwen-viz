@@ -16,7 +16,7 @@ export interface IBlkAccess {
 
 export interface IBlkDef {
     idx: number;
-    t: 'w' | 'i' | 'a'; // weights; intermediate value; other (used for full-attention layers)
+    t: 'w' | 'i' | 'a'; // weights; computed value; value in [0, 1]
     x: number; y: number; z: number;
     dx: number; dy: number; dz: number;
     cx: number; cy: number; cz: number;
@@ -37,9 +37,11 @@ export interface IModelLayout {
 }
 
 export const Colors = {
-    Weights: new Vec4(0.3, 0.3, 1.0),
-    Intermediates: new Vec4(0.4, 0.8, 0.4),
-    Aggregates: new Vec4(1.0, 0.8, 0.3),
+    // Positive pole of each block type. 'w' and 'i' share the diverging scale; 'a' is a
+    // one-hue ramp for values in [0, 1], such as attention weights and probabilities.
+    Weights: new Vec4(0.70, 0.20, 0.17),
+    Intermediates: new Vec4(0.70, 0.20, 0.17),
+    Aggregates: new Vec4(0.10, 0.12, 0.17),
     Black: new Vec4(0, 0, 0),
 };
 

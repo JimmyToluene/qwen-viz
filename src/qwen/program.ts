@@ -1,5 +1,5 @@
-import { cameraToMatrixView, genModelViewMatrices, ICamera, updateCamera } from "@/src/llm/Camera";
-import { IFontAtlasData, measureTextWidth, writeTextToBuffer } from "@/src/llm/render/fontRender";
+import { genModelViewMatrices, ICamera, updateCamera } from "@/src/llm/Camera";
+import { IFontAtlasData } from "@/src/llm/render/fontRender";
 import { addLine } from "@/src/llm/render/lineRender";
 import { initRender, IRenderState, IRenderView, renderModel, resetRenderBuffers } from "@/src/llm/render/modelRender";
 import { RenderPhase } from "@/src/llm/render/sharedRender";
@@ -8,7 +8,7 @@ import { Mat4f } from "@/src/utils/matrix";
 import { IBufferTex } from "@/src/utils/renderPhases";
 import { Vec3, Vec4 } from "@/src/utils/vector";
 import { IIndex, ITensorSet, ITrace } from "./data";
-import { genLayout, IArrow, IQBlock, IQLayout } from "./layout";
+import { genScene, IArrow, IQBlock, IQLayout } from "./layout";
 import { IStep, STEPS } from "./steps";
 
 export const DEFAULT_LINEAR = 12;
@@ -25,7 +25,7 @@ export interface IQState {
     trace: ITrace;
     embedW: ITensorSet | null;
     textures: Map<string, IBufferTex>;
-    expanded: number | null;
+    layer: number;
     stepIdx: number;
     tokenCursor: number;
     layoutDirty: boolean;
@@ -33,21 +33,22 @@ export interface IQState {
     firstFit: boolean;
     hover: IHover | null;
     mouse: [number, number];
-    overlay: { onFrame?: (s: IQState) => void };
+    overlay: { onFrame?: (s: IQState) => void; onLayout?: (version: number) => void };
     selectedKey: string | null;
+    frontView: boolean;
 }
 
 export function initState(canvas: HTMLCanvasElement, font: IFontAtlasData, index: IIndex, trace: ITrace): IQState | null {
     let render = initRender(canvas, font);
     if (!render) return null;
     let camera: ICamera = {
-        angle: new Vec3(285, 10, 20), center: new Vec3(0, 0, -1000), transition: {},
+        angle: new Vec3(298, 18, 5), center: new Vec3(0, 0, 0), transition: {},
         modelMtx: new Mat4f(), viewMtx: new Mat4f(), lookAtMtx: new Mat4f(), camPos: new Vec3(), camPosModel: new Vec3(),
     };
     let st: IQState = {
-        render, camera, examples: [], index, trace, embedW: null, textures: new Map(), expanded: null,
+        render, camera, examples: [], index, trace, embedW: null, textures: new Map(), layer: DEFAULT_LINEAR,
         stepIdx: 0, tokenCursor: 0, layoutDirty: true, pendingFit: true, firstFit: true, hover: null,
-        mouse: [-1, -1], overlay: {}, selectedKey: null, layout: null!,
+        mouse: [-1, -1], overlay: {}, selectedKey: null, layout: null!, frontView: false,
     };
     st.layout = buildLayout(st);
     return st;
@@ -72,7 +73,10 @@ function makeTex(st: IQState, key: string, w: number, h: number, build: () => Fl
 }
 
 export function buildLayout(st: IQState) {
-    return genLayout(st.index, st.trace, st.embedW, st.expanded, (k, w, h, b) => makeTex(st, k, w, h, b), st.tokenCursor);
+    return genScene({
+        index: st.index, trace: st.trace, embedW: st.embedW, scene: STEPS[st.stepIdx].scene, layer: st.layer,
+        tokenCursor: st.tokenCursor, tex: (k, w, h, b) => makeTex(st, k, w, h, b),
+    });
 }
 
 // Drop textures that belong to a prompt; weights are shared between prompts.
@@ -93,36 +97,44 @@ export function setTrace(st: IQState, trace: ITrace) {
 
 export function currentStep(st: IQState): IStep { return STEPS[st.stepIdx]; }
 
-function isFocused(step: IStep, b: IQBlock, expanded: number | null) {
-    if (step.groups.length === 0) return true;
-    if (b.group === 'tower') return step.groups.includes('tower');
-    if (b.layer !== null && b.layer !== expanded) return false;
-    return step.groups.includes(b.group);
-}
-
-// Frame the blocks of the current step from a fixed viewing direction.
+// Frame the whole scene from one consistent viewing direction, leaving room for the labels.
 export function fitCamera(st: IQState, instant = false) {
-    let step = currentStep(st);
-    let groups = step.fit ?? step.groups;
-    let bl = st.layout.cubes.filter(c => groups.length === 0 ? true : groups.includes(c.group));
-    if (bl.length === 0) bl = st.layout.cubes;
-    let min = new Vec3(1e12, 1e12, 1e12), max = new Vec3(-1e12, -1e12, -1e12);
+    let bl = st.layout.cubes;
+    if (bl.length === 0) return;
+    let tower = st.layout.scene === 'tower';
+    let ax = st.frontView ? 272 : tower ? 300 : 300, ay = st.frontView ? 2 : tower ? 16 : 20;
+    let ar = ax * Math.PI / 180, er = ay * Math.PI / 180;
+    // Camera axes in camera-space coordinates, where model (x, y, z) maps to (x, -z, -y).
+    let back = new Vec3(Math.cos(er) * Math.cos(ar), Math.cos(er) * Math.sin(ar), Math.sin(er));
+    let right = new Vec3(-Math.sin(ar), Math.cos(ar), 0);
+    let up = new Vec3(-Math.sin(er) * Math.cos(ar), -Math.sin(er) * Math.sin(ar), Math.cos(er));
+    let dot = (a: Vec3, b: Vec3) => a.x * b.x + a.y * b.y + a.z * b.z;
+    // Extents of every block corner along those axes; lens tags and titles widen the frame.
+    let extra = tower ? 120 : 0;
+    let rMin = 1e12, rMax = -1e12, uMin = 1e12, uMax = -1e12, bMin = 1e12, bMax = -1e12;
     for (let c of bl) {
-        min.x = Math.min(min.x, c.x); min.y = Math.min(min.y, c.y); min.z = Math.min(min.z, c.z);
-        max.x = Math.max(max.x, c.x + c.dx); max.y = Math.max(max.y, c.y + c.dy); max.z = Math.max(max.z, c.z + c.dz);
+        for (let i = 0; i < 8; i++) {
+            let x = c.x + (i & 1 ? c.dx + (c.layer !== null ? extra : 0) : 0), y = c.y + (i & 2 ? c.dy : 0), z = c.z + (i & 4 ? c.dz : 0);
+            let p = new Vec3(x, -z, -y);
+            let r = dot(p, right), u = dot(p, up), k = dot(p, back);
+            rMin = Math.min(rMin, r); rMax = Math.max(rMax, r);
+            uMin = Math.min(uMin, u); uMax = Math.max(uMax, u);
+            bMin = Math.min(bMin, k); bMax = Math.max(bMax, k);
+        }
     }
-    // Names start at a block's left edge and can run past its right edge.
-    for (let c of bl) if (c.label) max.x = Math.max(max.x, c.x + c.title.length * 2.6);
-    let w = max.x - min.x, h = max.y - min.y, d = max.z - min.z;
+    let w = rMax - rMin, h = uMax - uMin;
     let size = st.render.size;
     let aspect = size.x / Math.max(1, size.y);
     let tan = Math.tan(20 * Math.PI / 180);
-    let angled = step.view === 'angled';
-    let dist = Math.max((h + (angled ? d * 0.25 : 0)) / (2 * tan), (w + (angled ? d * 0.5 : 0)) / (2 * tan * aspect)) * 1.25 + d / 2;
-    dist = Math.max(dist, 160);
-    // Model (x, y, z) -> camera space (x, -z, -y)
-    let center = new Vec3((min.x + max.x) / 2, -(min.z + max.z) / 2, -(min.y + max.y) / 2);
-    let angle = new Vec3(angled ? 296 : 276, angled ? 16 : 6, dist / 200);
+    let dist = Math.max(h / (2 * tan), w / (2 * tan * aspect)) * (tower ? 1.03 : 1.28) + (bMax - bMin) / 2;
+    dist = Math.max(dist, 170);
+    // Look at the middle of the frame, a little higher than centre for the titles above blocks.
+    let midR = (rMin + rMax) / 2, midU = (uMin + uMax) / 2 + h * (tower ? 0.01 : 0.04), midB = (bMin + bMax) / 2;
+    let center = new Vec3(
+        right.x * midR + up.x * midU + back.x * midB,
+        right.y * midR + up.y * midU + back.y * midB,
+        right.z * midR + up.z * midU + back.z * midB);
+    let angle = new Vec3(ax, ay, dist / 200);
     if (instant) {
         st.camera.center = center;
         st.camera.angle = angle;
@@ -133,61 +145,54 @@ export function fitCamera(st: IQState, instant = false) {
     }
 }
 
-const inkHead = new Vec3(0, 0, 1);
-function arrowLine(r: IRenderState, a: Vec3, b: Vec3, color: Vec4) {
-    addLine(r.lineRender, 1.2, color, a, b, new Vec3(0, 0, 1));
-}
-function arrowHead(r: IRenderState, tip: Vec3, dir: Vec3, color: Vec4, size = 2.6) {
-    let side = new Vec3(-dir.y, dir.x, 0);
-    let base = tip.sub(dir.mul(size * 1.5));
-    addVert(r.triRender, base.add(side.mul(size)), color, inkHead);
-    addVert(r.triRender, tip, color, inkHead);
-    addVert(r.triRender, base.sub(side.mul(size)), color, inkHead);
-    addPrimitiveRestart(r.triRender);
-}
+const worldPerPx = (st: IQState) => 2 * st.camera.angle.z * 200 * Math.tan(20 * Math.PI / 180) / Math.max(1, st.render.size.y);
+const inkN = new Vec3(0, 0, 1);
 
-function drawArrow(r: IRenderState, ar: IArrow, step: IStep, st: IQState) {
-    let { from: f, to: t, mode } = ar;
-    let o = Math.min(f.opacity, t.opacity);
-    if (o <= 0.05) return;
-    let isW = f.t === 'w';
-    let color = (isW ? new Vec4(0.2, 0.2, 0.67, 1) : new Vec4(0.2, 0.6, 0.2, 1)).mul(0.75 * o);
-    let zm = (b: IQBlock) => b.z + b.dz / 2;
-    let pad = 1.5;
-    let fz = zm(f), tz = zm(t);
+function drawArrow(st: IQState, ar: IArrow) {
+    let r = st.render, { from: f, to: t, mode } = ar;
+    let px = worldPerPx(st);
+    let color = new Vec4(0.42, 0.42, 0.45, 1);
+    let pad = 3 * px;
+    let zf = f.z + f.dz / 2, zt = t.z + t.dz / 2;
     let pts: Vec3[];
     if (mode === 'h') {
         let ltr = f.x + f.dx <= t.x;
         let ay = f.y + f.dy / 2, by = t.y + t.dy / 2;
-        let y = Math.abs(ay - by) < Math.min(f.dy, t.dy) / 2 ? (ay + by) / 2 : null;
         let ax = ltr ? f.x + f.dx + pad : f.x - pad;
         let bx = ltr ? t.x - pad : t.x + t.dx + pad;
-        pts = y !== null
-            ? [new Vec3(ax, y, fz), new Vec3(bx, y, tz)]
-            : [new Vec3(ax, ay, fz), new Vec3((ax + bx) / 2, ay, fz), new Vec3((ax + bx) / 2, by, tz), new Vec3(bx, by, tz)];
-    } else if (mode === 'v') {
+        pts = Math.abs(ay - by) < 0.5
+            ? [new Vec3(ax, ay, zf), new Vec3(bx, by, zt)]
+            : [new Vec3(ax, ay, zf), new Vec3((ax + bx) / 2, ay, zf), new Vec3((ax + bx) / 2, by, zt), new Vec3(bx, by, zt)];
+    } else if (mode === 'side') {
+        let ax = f.x + f.dx + pad, ay = f.y + f.dy / 2, by = t.y + t.dy / 2;
+        let bx = t.x + t.dx + pad, out = Math.max(ax, bx) + 10;
+        pts = [new Vec3(ax, ay, zf), new Vec3(out, ay, zf), new Vec3(out, by, zt), new Vec3(bx, by, zt)];
+    } else {
         let ax = f.x + f.dx / 2, bx = t.x + t.dx / 2;
         let ay = f.y + f.dy + pad, by = t.y - pad;
-        pts = Math.abs(ax - bx) < 0.01
-            ? [new Vec3(ax, ay, fz), new Vec3(bx, by, tz)]
-            : [new Vec3(ax, ay, fz), new Vec3(ax, (ay + by) / 2, fz), new Vec3(bx, (ay + by) / 2, tz), new Vec3(bx, by, tz)];
-    } else if (mode === 'rt') {
-        // Residual stream, branching left into a side block.
-        let ax = f.x - pad, ay = f.y + f.dy - 2;
-        let bx = t.x + t.dx + pad, by = t.y + t.dy / 2;
-        let midX = (ax + bx) / 2;
-        pts = [new Vec3(ax, ay, fz), new Vec3(midX, ay, fz), new Vec3(midX, by, tz), new Vec3(bx, by, tz)];
-    } else {
-        // From the bottom of `from`, across, then into the top of `to`.
-        let ax = f.x + f.dx / 2, ay = f.y + f.dy + pad;
-        let bx = t.x + t.dx / 2, by = t.y - pad;
-        let my = ay + (by - ay) * 0.5;
-        pts = [new Vec3(ax, ay, fz), new Vec3(ax, my, fz), new Vec3(bx, my, tz), new Vec3(bx, by, tz)];
+        pts = Math.abs(ax - bx) < 0.5
+            ? [new Vec3(ax, ay, zf), new Vec3(bx, by, zt)]
+            : [new Vec3(ax, ay, zf), new Vec3(ax, (ay + by) / 2, zf), new Vec3(bx, (ay + by) / 2, zt), new Vec3(bx, by, zt)];
     }
-    for (let i = 0; i + 1 < pts.length; i++) arrowLine(r, pts[i], pts[i + 1], color);
+    let thick = 0.75 * px;
+    for (let i = 0; i + 1 < pts.length; i++) addLine(r.lineRender, thick, color, pts[i], pts[i + 1], inkN);
     let n = pts.length;
     let dir = pts[n - 1].sub(pts[n - 2]).normalize();
-    arrowHead(r, pts[n - 1], dir, color);
+    let side = new Vec3(-dir.y, dir.x, 0), size = 3.6 * px;
+    let tip = pts[n - 1], base = tip.sub(dir.mul(size * 1.6));
+    addVert(r.triRender, base.add(side.mul(size)), color, inkN);
+    addVert(r.triRender, tip, color, inkN);
+    addVert(r.triRender, base.sub(side.mul(size)), color, inkN);
+    addPrimitiveRestart(r.triRender);
+}
+
+function outline(st: IQState, b: IQBlock) {
+    let r = st.render, z = b.z + b.dz + 0.05, px = worldPerPx(st), m = 1.5 * px;
+    let c = new Vec4(0.1, 0.1, 0.14, 1), t = 0.8 * px;
+    let tl = new Vec3(b.x - m, b.y - m, z), tr = new Vec3(b.x + b.dx + m, b.y - m, z);
+    let bl = new Vec3(b.x - m, b.y + b.dy + m, z), br = new Vec3(b.x + b.dx + m, b.y + b.dy + m, z);
+    addLine(r.lineRender, t, c, tl, tr, inkN); addLine(r.lineRender, t, c, tr, br, inkN);
+    addLine(r.lineRender, t, c, br, bl, inkN); addLine(r.lineRender, t, c, bl, tl, inkN);
 }
 
 function rayBox(tl: Vec3, br: Vec3, o: Vec3, d: Vec3) {
@@ -215,7 +220,6 @@ export function hitTest(st: IQState) {
     let dir = b.sub(a).normalize();
     let best: IQBlock | null = null, bestT = 0;
     for (let c of st.layout.cubes) {
-        if (c.opacity < 0.5) continue;
         let t = rayBox(new Vec3(c.x, c.y, c.z), new Vec3(c.x + c.dx, c.y + c.dy, c.z + c.dz), a, dir);
         if (t > 0 && (!best || t < bestT)) { best = c; bestT = t; }
     }
@@ -249,55 +253,27 @@ export function runFrame(view: IRenderView, st: IQState) {
     render.sharedRender.activePhase = RenderPhase.Opaque;
 
     if (st.layoutDirty) {
+        let prevScene = st.layout?.scene;
         st.layout = buildLayout(st);
         st.layoutDirty = false;
+        if (st.layout.scene !== prevScene) st.pendingFit = true;
+        st.overlay.onLayout?.(st.layout.version);
     }
-    let step = currentStep(st);
     if (st.pendingFit && render.size.x > 1) {
         fitCamera(st, st.firstFit);
         st.firstFit = false;
         st.pendingFit = false;
     }
 
-    // Dim everything the current step isn't about.
-    for (let c of st.layout.cubes) {
-        c.opacity = isFocused(step, c, st.expanded) ? 1 : 0.14;
-        c.highlight = 0;
-    }
-
-    genModelViewMatrices(st as any, st.layout);
+    genModelViewMatrices(st as any, st.layout as any);
     updateCamera(st as any, view);
     hitTest(st);
-    if (st.hover) st.hover.block.highlight = 0.35;
-    if (st.selectedKey && st.layout.byKey[st.selectedKey]) st.layout.byKey[st.selectedKey].highlight = 0.5;
 
     render.sharedRender.activePhase = RenderPhase.Arrows;
-    for (let ar of st.layout.arrows) drawArrow(render, ar, step, st);
-
-    // Block names. ASCII only: the font atlas has no CJK; tokens are HTML labels instead.
-    // Drawn after the arrows so an arrow never covers a name.
+    for (let ar of st.layout.arrows) drawArrow(st, ar);
     render.sharedRender.activePhase = RenderPhase.Overlay;
-    let fontSize = Math.max(3.2, Math.min(st.camera.angle.z * 0.55, 16));
-    let rows = new Map<number, IQBlock[]>();
-    for (let c of st.layout.cubes) {
-        if (!c.label || c.opacity < 0.5 || c.group === 'tower') continue;
-        let k = Math.round(c.y);
-        if (!rows.has(k)) rows.set(k, []);
-        rows.get(k)!.push(c);
-    }
-    for (let row of rows.values()) {
-        // Narrow neighbours would collide, so step their labels upwards from right to left.
-        row.sort((a, b) => b.x - a.x);
-        let lane = 0, prevLeft = Infinity;
-        for (let c of row) {
-            let w = measureTextWidth(render.modelFontBuf, c.title, fontSize);
-            lane = c.x + w + 2 > prevLeft ? lane + 1 : 0;
-            prevLeft = lane === 0 ? c.x : Math.min(prevLeft, c.x);
-            let mtx = new Mat4f();
-            mtx[14] = c.z + c.dz;
-            writeTextToBuffer(render.modelFontBuf, c.title, new Vec4(0.15, 0.15, 0.2, 1), c.x, c.y - (lane + 1) * (fontSize * 1.15) - 1, fontSize, mtx);
-        }
-    }
+    if (st.hover && st.hover.block.tensor) outline(st, st.hover.block);
+    if (st.selectedKey && st.layout.byKey[st.selectedKey]) outline(st, st.layout.byKey[st.selectedKey]);
 
     render.sharedRender.activePhase = RenderPhase.Opaque;
     renderModel(st as any);
@@ -310,18 +286,12 @@ export function axisText(st: IQState, h: IHover) {
     let ax = h.block.axes;
     if (!ax) return parts;
     let tokens = st.trace.manifest.tokens;
-    let one = (a: IQBlock['axes'] extends infer _ ? any : never, c: number) => {
+    let one = (a: { name: string; stride: number; of: number; kind?: string } | undefined, c: number) => {
         if (!a) return;
-        if (a.kind === 'token') {
-            parts.push(`${a.name} ${c} ${JSON.stringify(tokens[c]?.text ?? '')}`);
-        } else {
-            parts.push(`${a.name} ${c * a.stride} of ${a.of}`);
-        }
+        if (a.kind === 'token') parts.push(`${a.name} ${c} ${JSON.stringify(tokens[c]?.text ?? '')}`);
+        else parts.push(`${a.name} ${c * a.stride} of ${a.of}`);
     };
     one(ax.x, h.cell[0]);
     one(ax.y, h.cell[1]);
-    one(ax.z, h.cell[2]);
     return parts;
 }
-
-export { cameraToMatrixView };

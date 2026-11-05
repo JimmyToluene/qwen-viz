@@ -199,6 +199,7 @@ def trace_prompt(model, tok, key, text, out_dir, device):
     ov = Writer(out_dir / "overview.bin")
     ov.add("embed", to_np(captured["embed"][0]))
     lens = []
+    attn_last = []   # full-attention layers: the final token's weights, averaged over heads
     residual_gap = 0.0
     for i, layer in enumerate(lm.layers):
         p = f"L{i}."
@@ -255,6 +256,7 @@ def trace_prompt(model, tok, key, text, out_dir, device):
             w.add("k", to_np(captured[p + "k_norm"][0]))
             w.add("v", to_np(captured[p + "v_proj"][0].float().reshape(T, 4, 256)))
             w.add("attn_w", to_np(captured[p + "attn_w"][0]))  # (16, T, T)
+            attn_last.append(dict(layer=i, weights=[float(x) for x in captured[p + "attn_w"][0].float().mean(0)[-1]]))
             attn_out = captured[p + "o_proj"][0].float()
             w.add("attn_out", to_np(attn_out))
         x_mid = x_in + attn_out
@@ -281,7 +283,7 @@ def trace_prompt(model, tok, key, text, out_dir, device):
     tv = [json.loads((out_dir / f"layer_{i:02d}.json").read_text()) for i in range(len(lm.layers))]
     tv_sizes = sum((out_dir / f"layer_{i:02d}.bin").stat().st_size for i in range(len(lm.layers)))
     manifest = dict(key=key, text=text, T=T, tokens=tokens, predictions=predictions, lens=lens,
-                    overview=overview, checks=checks, layer_bytes=tv_sizes)
+                    overview=overview, checks=checks, layer_bytes=tv_sizes, attn_last=attn_last)
     (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False))
     worst = {k: v for k, v in checks.items() if "L" not in k}
     worst["replay_vs_kernel_max"] = max(v for k, v in checks.items() if k.endswith("replay_vs_kernel"))
